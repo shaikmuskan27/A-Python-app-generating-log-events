@@ -73,11 +73,19 @@ func logsHandler(w http.ResponseWriter, r *http.Request) {
 	findOptions.SetSort(bson.D{{Key: "timestamp", Value: -1}})
 	findOptions.SetLimit(100)
 
-	// Optional filtering by severity
+	// Optional filtering by severity and search
 	severity := r.URL.Query().Get("severity")
+	search := r.URL.Query().Get("search")
 	filter := bson.M{}
 	if severity != "" && severity != "ALL" {
 		filter["severity"] = severity
+	}
+	if search != "" {
+		filter["$or"] = []bson.M{
+			{"message": bson.M{"$regex": search, "$options": "i"}},
+			{"service_name": bson.M{"$regex": search, "$options": "i"}},
+			{"container_id": bson.M{"$regex": search, "$options": "i"}},
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
