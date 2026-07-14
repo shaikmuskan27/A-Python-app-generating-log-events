@@ -8,9 +8,6 @@ services:
     container_name: target-app
     ports:
       - "5000:5000"
-    # Wait for observer to be ready so we don't miss logs, though observer tails from now ("0").
-    # It's better for observer to start first or target-app can just run.
-    # We will let them start normally.
     restart: unless-stopped
 
   observer:
@@ -26,6 +23,29 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - mongodb
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+    image: api:latest
+    container_name: api
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017
+      - PORT=8080
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    image: frontend:latest
+    container_name: frontend
+    ports:
+      - "8080:80" # Expose the web dashboard on port 8080
+    depends_on:
+      - api
     restart: unless-stopped
 
   mongodb:
