@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,31 +15,71 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
+	"go.mongodb.org/mongo-driver/mongo"
 )
+
+func getDockerClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", "/var/run/docker.sock")
+			},
+		},
+	}
+}
+
+type DockerContainer struct {
+	Id    string   `json:"Id"`
+	Names []string `json:"Names"`
+}
+
+func getTargetContainerID(client *http.Client, targetName string) (string, error) {
+	resp, err := client.Get("http://localhost/containers/json")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var containers []DockerContainer
+	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
+		return "", err
+	}
+
+	for _, ctr := range containers {
+		for _, name := range ctr.Names {
+			if name == "/"+targetName {
+				return ctr.Id, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("container %s not found", targetName)
+}
 
 func main() {
 	log.Println("Starting Observer Service...")
 
-	// Initialize MongoDB Client
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
 		mongoURI = "mongodb://localhost:27017"
 	}
-	
-	mongoClient, err := ConnectMongo(mongoURI)
+
+	// Retry connecting to MongoDB up to 5 times
+	var mongoClient *mongo.Client
+	var err error
+	for i := 0; i < 5; i++ {
+		mongoClient, err = ConnectMongo(mongoURI)
+		if err == nil {
+			break
+		}
+		log.Printf("MongoDB not ready yet... retrying in 3 seconds (%v)", err)
+		time.Sleep(3 * time.Second)
+	}
 	if err != nil {
-		log.Fatalf("Failed to connect to MongoDB: %v", err)
+		log.Fatalf("Failed to connect to MongoDB after retries: %v", err)
 	}
 	defer mongoClient.Disconnect(context.Background())
 
-	// Initialize Docker Client
-	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		log.Fatalf("Failed to create Docker client: %v", err)
-	}
-	defer dockerClient.Close()
+	dockerClient := getDockerClient()
 
 	targetContainerName := os.Getenv("TARGET_CONTAINER")
 	if targetContainerName == "" {
@@ -48,7 +91,6 @@ func main() {
 	flushInterval := 5 * time.Second
 	maxBufferSize := 1000
 
-	// Start a ticker to flush buffer periodically
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 
@@ -61,64 +103,41 @@ func main() {
 				if err != nil {
 					log.Printf("Error flushing buffer: %v", err)
 				} else {
-					logBuffer = make([]LogEntry, 0) // reset buffer
+					logBuffer = make([]LogEntry, 0)
 				}
 			}
 			mu.Unlock()
 		}
 	}()
 
-	// Wait for container to be available
 	log.Printf("Waiting for container %s to be available...", targetContainerName)
 	var targetContainerID string
 	for {
-		containers, err := dockerClient.ContainerList(context.Background(), types.ContainerListOptions{})
-		if err != nil {
-			log.Printf("Error listing containers: %v", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		
-		found := false
-		for _, ctr := range containers {
-			for _, name := range ctr.Names {
-				// Docker prepends a slash to the name
-				if name == "/"+targetContainerName {
-					targetContainerID = ctr.ID
-					found = true
-					break
-				}
-			}
-		}
-		if found {
+		id, err := getTargetContainerID(dockerClient, targetContainerName)
+		if err == nil {
+			targetContainerID = id
 			break
 		}
+		log.Printf("Looking for container: %v", err)
 		time.Sleep(2 * time.Second)
 	}
 
 	log.Printf("Found container %s (ID: %s). Tailing logs...", targetContainerName, targetContainerID[:12])
 
-	// Tail logs
 	go func() {
-		// Attempt to read logs
 		for {
-			options := types.ContainerLogsOptions{
-				ShowStdout: true,
-				ShowStderr: true,
-				Follow:     true,
-				Tail:       "0", // start from now
-			}
-			out, err := dockerClient.ContainerLogs(context.Background(), targetContainerID, options)
+			url := fmt.Sprintf("http://localhost/containers/%s/logs?stdout=1&stderr=1&follow=1&tail=0", targetContainerID)
+			resp, err := dockerClient.Get(url)
 			if err != nil {
 				log.Printf("Error getting container logs: %v. Retrying in 2 seconds...", err)
 				time.Sleep(2 * time.Second)
 				continue
 			}
 
-			scanner := bufio.NewScanner(out)
+			scanner := bufio.NewScanner(resp.Body)
 			for scanner.Scan() {
 				line := scanner.Text()
-				
+
 				idx := strings.Index(line, "{")
 				if idx == -1 {
 					continue
@@ -127,41 +146,37 @@ func main() {
 
 				var entry LogEntry
 				if err := json.Unmarshal([]byte(jsonPart), &entry); err != nil {
-					continue // not a valid log entry or parse error
+					continue
 				}
 
-				// If it's an ERROR, trigger an alert
 				if entry.Severity == "ERROR" {
 					go TriggerAlert(entry)
 				}
 
 				mu.Lock()
 				logBuffer = append(logBuffer, entry)
-				
-				// Force flush if max size reached
+
 				if len(logBuffer) >= maxBufferSize {
 					log.Printf("Buffer reached max capacity (%d), flushing...", maxBufferSize)
 					err := FlushBuffer(mongoClient, logBuffer)
 					if err != nil {
 						log.Printf("Error flushing buffer: %v", err)
 					} else {
-						logBuffer = make([]LogEntry, 0) // reset buffer
+						logBuffer = make([]LogEntry, 0)
 					}
 				}
 				mu.Unlock()
 			}
-			out.Close()
-			time.Sleep(2 * time.Second) // loop and reconnect if stream dies
+			resp.Body.Close()
+			time.Sleep(2 * time.Second)
 		}
 	}()
 
-	// Channel for graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 	log.Println("Shutting down Observer Service...")
-	
-	// Final flush
+
 	mu.Lock()
 	if len(logBuffer) > 0 {
 		log.Printf("Final flush of %d logs to MongoDB...", len(logBuffer))
