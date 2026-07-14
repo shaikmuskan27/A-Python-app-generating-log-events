@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 )
 
@@ -72,7 +72,7 @@ func main() {
 	log.Printf("Waiting for container %s to be available...", targetContainerName)
 	var targetContainerID string
 	for {
-		containers, err := dockerClient.ContainerList(context.Background(), container.ListOptions{})
+		containers, err := dockerClient.ContainerList(context.Background(), types.ContainerListOptions{})
 		if err != nil {
 			log.Printf("Error listing containers: %v", err)
 			time.Sleep(2 * time.Second)
@@ -102,7 +102,7 @@ func main() {
 	go func() {
 		// Attempt to read logs
 		for {
-			options := container.LogsOptions{
+			options := types.ContainerLogsOptions{
 				ShowStdout: true,
 				ShowStderr: true,
 				Follow:     true,
