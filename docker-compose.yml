@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  target-app:
+    build:
+      context: ./target-app
+    image: target-app:latest
+    container_name: target-app
+    ports:
+      - "5000:5000"
+    # Wait for observer to be ready so we don't miss logs, though observer tails from now ("0").
+    # It's better for observer to start first or target-app can just run.
+    # We will let them start normally.
+    restart: unless-stopped
+
+  observer:
+    build:
+      context: ./observer
+    image: observer:latest
+    container_name: observer
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017
+      - TARGET_CONTAINER=target-app
+      - WEBHOOK_URL=http://httpbin.org/post
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+volumes:
+  mongo-data:

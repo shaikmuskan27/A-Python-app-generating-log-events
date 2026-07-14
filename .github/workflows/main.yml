@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Build and start Docker containers
+        run: docker-compose up -d --build
+
+      - name: Wait for services to initialize
+        run: sleep 15
+
+      - name: Trigger Target App Error Log
+        run: curl -s http://localhost:5000/error
+
+      - name: Wait for Observer to process log
+        run: sleep 10
+
+      - name: Verify log entry in MongoDB
+        run: |
+          docker exec mongodb mongosh --eval '
+            db = db.getSiblingDB("logsdb");
+            var count = db.logs.countDocuments({severity: "ERROR"});
+            if (count > 0) {
+                print("Test Passed: Found " + count + " ERROR logs.");
+                quit(0);
+            } else {
+                print("Test Failed: No ERROR logs found.");
+                quit(1);
+            }
+          '
